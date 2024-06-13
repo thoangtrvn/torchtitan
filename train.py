@@ -32,12 +32,18 @@ from torchtitan.logging_utils import init_logger, logger
 from torchtitan.lr_scheduling import get_lr_scheduler
 from torchtitan.metrics import build_gpu_memory_monitor, build_metric_logger
 from torchtitan.models import model_name_to_cls, model_name_to_tokenizer, models_config
-from torchtitan.parallelisms import models_parallelize_fns, ParallelDims
+from torchtitan.parallelisms import (
+    models_parallelize_fns,
+    models_pipelining_fns,
+    ParallelDims,
+)
+from torchtitan.parallelisms.pipelining_utils import build_pipeline_schedule
 from torchtitan.profiling import maybe_enable_profiling
 from torchtitan.utils import (
     Color,
     dist_max,
     dist_mean,
+    get_metrics_rank,
     get_num_flop_per_token,
     get_num_params,
     get_peak_flops,
@@ -88,15 +94,21 @@ def build_optimizer(model, job_config: JobConfig):
     # build optimizer
     name = job_config.optimizer.name
     lr = job_config.optimizer.lr
+    fused = job_config.optimizer.fused
+
+    # Common parameters for both optimizers
+    optimizer_kwargs = {
+        "lr": lr,
+        "betas": (0.9, 0.95),
+        "weight_decay": 0.1,
+        "fused": fused,
+        "foreach": not fused,
+    }
     if name == "Adam":
         # TODO: make the optimizer options configurable by toml/cmd args
-        optimizer = torch.optim.Adam(
-            model.parameters(), lr=lr, betas=(0.9, 0.95), weight_decay=0.1, foreach=True
-        )
+        optimizer = torch.optim.Adam(model.parameters(), **optimizer_kwargs)
     elif name == "AdamW":
-        optimizer = torch.optim.AdamW(
-            model.parameters(), lr=lr, betas=(0.9, 0.95), weight_decay=0.1, foreach=True
-        )
+        optimizer = torch.optim.AdamW(model.parameters(), **optimizer_kwargs)
     else:
         raise NotImplementedError(f"Optimizer {name} not added.")
 
@@ -122,11 +134,12 @@ def main(job_config: JobConfig):
     parallel_dims = ParallelDims(
         dp=job_config.training.data_parallel_degree,
         tp=job_config.training.tensor_parallel_degree,
-        pp=job_config.training.pipeline_parallel_degree,
+        pp=job_config.experimental.pipeline_parallel_degree,
         world_size=world_size,
         enable_loss_parallel=job_config.training.enable_loss_parallel,
     )
-    torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
+    device = torch.device(f"cuda:{int(os.environ['LOCAL_RANK'])}")
+    torch.cuda.set_device(device)
     init_distributed(job_config)
 
     world_mesh = parallel_dims.build_mesh(device_type="cuda")
@@ -144,6 +157,10 @@ def main(job_config: JobConfig):
         dp_rank = dp_mesh.get_local_rank()
     else:
         dp_degree, dp_rank = 1, 0
+
+    if parallel_dims.pp_enabled:
+        pp_mesh = world_mesh["pp"]
+
     data_loader = build_hf_data_loader(
         job_config.training.dataset,
         job_config.training.dataset_path,
@@ -201,13 +218,27 @@ def main(job_config: JobConfig):
     # obtain the peak flops of bf16 type for MFU calculation
     gpu_peak_flops = get_peak_flops(gpu_memory_monitor.device_name)
 
-    # apply PT-D parallelisms and activation checkpointing
+    if parallel_dims.pp_enabled:
+        stage, model = models_pipelining_fns[model_name](
+            model, world_mesh, parallel_dims, job_config, device, model_config
+        )
+
+    # apply PT-D DP/TP parallelisms and activation checkpointing
     model = models_parallelize_fns[model_name](
         model, world_mesh, parallel_dims, job_config
     )
-    # allocate sharded model on GPU and initialize weights via DTensor
-    model.to_empty(device="cuda")
-    model.init_weights()
+
+    init_device = "cpu" if job_config.checkpoint.create_seed_checkpoint else "cuda"
+    model.to_empty(device=init_device)
+
+    if parallel_dims.pp_enabled:
+        pp_schedule = build_pipeline_schedule(job_config, parallel_dims, stage, loss_fn)
+    else:
+        # If PP is enabled, we can't rely on init_weights, because some layers are missing.
+        # In the future, we may make init_weights handle missing layers, but also have to consider RNG seed propagation.
+
+        # allocate sharded model on GPU and initialize weights via DTensor
+        model.init_weights()
 
     gpu_mem_stats = gpu_memory_monitor.get_peak_stats()
     logger.info(
@@ -220,21 +251,9 @@ def main(job_config: JobConfig):
     optimizer = build_optimizer(model, job_config)
     scheduler = get_lr_scheduler(optimizer, job_config)
 
-    metric_logger = build_metric_logger(job_config)
-
-    # torch.compile model for improved performance
-    if job_config.training.compile:
-        if (
-            job_config.activation_checkpoint.mode == "selective"
-            and job_config.activation_checkpoint.selective_ac_option == "op"
-        ):
-            torch._dynamo.config._experimental_support_context_fn_in_torch_utils_checkpoint = (
-                True
-            )
-        logger.info("Compiling model with torch.compile")
-        # Dynamic shape have issues with distributed, turn dynamic off as Transformer
-        # training is static_shape TODO: resolve dynamic shape issue and restore defaults
-        model = torch.compile(model, dynamic=False)
+    metric_logger = build_metric_logger(
+        job_config, metrics_log_rank=get_metrics_rank(world_mesh, parallel_dims)
+    )
 
     train_state = TrainState()
 
@@ -245,6 +264,7 @@ def main(job_config: JobConfig):
         model=model,
         optimizer=optimizer,
         lr_scheduler=scheduler,
+        dataloader=data_loader,
         states={"train_state": train_state},
         job_config=job_config,
     )
@@ -257,7 +277,13 @@ def main(job_config: JobConfig):
         logger.info("Created seed checkpoint")
         return
 
-    checkpoint.load()
+    checkpoint_loaded = checkpoint.load()
+
+    if parallel_dims.pp_enabled and not checkpoint_loaded:
+        raise RuntimeError(
+            "Pipeline Parallelism requires meta-initialization and loading seed checkpoint. "
+            "Please run `./create_seed_checkpoint.sh` and rerun training with `--checkpoint.enable_checkpoint`"
+        )
 
     # plot losses loaded from checkpoint (if any) to TensorBoard
     # NOTE: Loss info after the last log step before checkpoint saving will not be ploted.
@@ -299,14 +325,36 @@ def main(job_config: JobConfig):
 
             input_ids = input_ids.cuda()
             labels = labels.cuda()
-
             optimizer.zero_grad()
 
-            # forward / backward
-            with loss_parallel_ctx():
-                pred = model(input_ids)
-                loss = loss_fn(pred, labels)
-                loss.backward()
+            if parallel_dims.pp_enabled:
+                # pipeline parallel forward / backward inside step() call
+                is_last_stage = pp_mesh.get_local_rank() == pp_mesh.size() - 1
+
+                with loss_parallel_ctx():
+                    if pp_mesh.get_local_rank() == 0:
+                        pp_schedule.step(input_ids)
+                    elif is_last_stage:
+                        losses = []
+                        pp_schedule.step(target=labels, losses=losses)
+                    else:
+                        pp_schedule.step()
+
+                # accumulate losses across pipeline microbatches
+                loss = (
+                    torch.mean(torch.stack(losses))
+                    if is_last_stage
+                    else torch.Tensor([-1.0])
+                )
+            else:
+                # Non-PP forward / backward
+                with loss_parallel_ctx():
+                    pred = model(input_ids)
+                    loss = loss_fn(pred, labels)
+                    # pred.shape=(bs, seq_len, vocab_size)
+                    # need to free to before bwd to avoid peaking memory
+                    del pred
+                    loss.backward()
 
             # clip gradients
             torch.nn.utils.clip_grad_norm_(

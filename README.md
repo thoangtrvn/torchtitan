@@ -1,4 +1,5 @@
-[![GPU Integration Test](https://github.com/pytorch/torchtitan/actions/workflows/unit_test_4gpu.yaml/badge.svg?branch=main)](https://github.com/pytorch/torchtitan/actions/workflows/unit_test_4gpu.yaml)
+[![4 GPU Integration Test](https://github.com/pytorch/torchtitan/actions/workflows/integration_test_4gpu.yaml/badge.svg?branch=main)](https://github.com/pytorch/torchtitan/actions/workflows/integration_test_4gpu.yaml?query=branch%3Amain)
+[![8 GPU Integration Test](https://github.com/pytorch/torchtitan/actions/workflows/integration_test_8gpu.yaml/badge.svg?branch=main)](https://github.com/pytorch/torchtitan/actions/workflows/integration_test_8gpu.yaml?query=branch%3Amain)
 
 # torchtitan
 
@@ -37,6 +38,7 @@ We report our [Performance](docs/performance.md) verified on 64 A100 GPUs
 
 
 ### Coming soon
+
 1. Async checkpointing
 2. FP8 support
 3. Context Parallel
@@ -52,6 +54,7 @@ git clone https://github.com/pytorch/torchtitan
 cd torchtitan
 pip install -r requirements.txt
 pip3 install --pre torch --index-url https://download.pytorch.org/whl/nightly/cu121 # or cu118
+pip3 install --pre torchdata --index-url https://download.pytorch.org/whl/nightly
 ```
 
 ### Downloading a tokenizer

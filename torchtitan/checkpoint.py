@@ -5,33 +5,29 @@
 # LICENSE file in the root directory of this source tree.
 
 import enum
+import functools
 import os
 import re
+import shutil
 import time
 from multiprocessing import get_context
-from typing import Any, Dict
+from typing import Any, Dict, List, Union
 
 import torch
 import torch.distributed as dist
 import torch.distributed.checkpoint as dcp
 import torch.nn as nn
-from torch.distributed._state_dict_utils import _copy_state_dict, _create_cpu_state_dict
 from torch.distributed.checkpoint.state_dict import (
     get_model_state_dict,
     get_optimizer_state_dict,
     set_model_state_dict,
     set_optimizer_state_dict,
+    StateDictOptions,
 )
 from torch.distributed.checkpoint.stateful import Stateful
-from torchtitan.config_manager import JobConfig
+from torch.utils.data import DataLoader
+from torchtitan.config_manager import JobConfig, TORCH_DTYPE_MAP
 from torchtitan.logging_utils import init_logger, logger
-
-
-DTYPE_MAP = {
-    "float16": torch.float16,
-    "float32": torch.float32,
-    "bfloat16": torch.bfloat16,
-}
 
 
 class IntervalType(enum.Enum):
@@ -46,26 +42,46 @@ class AsyncMode(str, enum.Enum):
 
 
 class ModelWrapper(Stateful):
-    def __init__(self, model: nn.Module) -> None:
-        self.model = model
+    def __init__(self, model: Union[nn.Module, List[nn.Module]]) -> None:
+        self.model = [model] if isinstance(model, nn.Module) else model
 
     def state_dict(self) -> None:
-        return get_model_state_dict(self.model)
+        return {
+            k: v for sd in map(get_model_state_dict, self.model) for k, v in sd.items()
+        }
 
     def load_state_dict(self, state_dict: Dict[str, Any]) -> None:
-        set_model_state_dict(self.model, state_dict)
+        func = functools.partial(
+            set_model_state_dict,
+            model_state_dict=state_dict,
+            options=StateDictOptions(strict=False),
+        )
+        list(map(func, self.model))
 
 
 class OptimizerWrapper(Stateful):
-    def __init__(self, model: nn.Module, optim: torch.optim.Optimizer) -> None:
-        self.model = model
-        self.optim = optim
+    def __init__(
+        self,
+        model: Union[nn.Module, List[nn.Module]],
+        optim: Union[torch.optim.Optimizer, List[torch.optim.Optimizer]],
+    ) -> None:
+        self.model = [model] if isinstance(model, nn.Module) else model
+        self.optim = [optim] if isinstance(optim, torch.optim.Optimizer) else optim
 
     def state_dict(self) -> None:
-        return get_optimizer_state_dict(self.model, self.optim)
+        func = functools.partial(
+            get_optimizer_state_dict,
+            options=StateDictOptions(flatten_optimizer_state_dict=True),
+        )
+        return {k: v for sd in map(func, self.model, self.optim) for k, v in sd.items()}
 
     def load_state_dict(self, state_dict: Dict[str, Any]) -> None:
-        set_optimizer_state_dict(self.model, self.optim, optim_state_dict=state_dict)
+        func = functools.partial(
+            set_optimizer_state_dict,
+            optim_state_dict=state_dict,
+            options=StateDictOptions(flatten_optimizer_state_dict=True),
+        )
+        list(map(func, self.model, self.optim))
 
 
 class Terminate:
@@ -111,11 +127,13 @@ class CheckpointManager:
         model: nn.Module,
         optimizer: torch.optim.Optimizer,
         lr_scheduler: torch.optim.lr_scheduler.LRScheduler,
+        dataloader: DataLoader,
         states: Dict[str, Any],
         job_config: JobConfig,
     ) -> None:
         ckpt_config = job_config.checkpoint
         self.enable_checkpoint = ckpt_config.enable_checkpoint
+        self.keep_latest_k = ckpt_config.keep_latest_k
 
         if not self.enable_checkpoint:
             return
@@ -126,6 +144,7 @@ class CheckpointManager:
                 "model": ModelWrapper(model),
                 "optimizer": OptimizerWrapper(model, optimizer),
                 "lr_scheduler": lr_scheduler,
+                "dataloader": dataloader,
             }
         )
 
@@ -142,7 +161,7 @@ class CheckpointManager:
         self.pg = dist.new_group(backend="gloo")
 
         self.model_weights_only = ckpt_config.model_weights_only
-        self.export_dtype = DTYPE_MAP[ckpt_config.export_dtype]
+        self.export_dtype = TORCH_DTYPE_MAP[ckpt_config.export_dtype]
 
         self.mp = None
         async_mode = ckpt_config.async_mode.lower()
@@ -267,6 +286,15 @@ class CheckpointManager:
                 self.async_future.result()
 
     def _async_with_pinned_memory(self, checkpoint_id: str) -> None:
+        try:
+            from torch.distributed._state_dict_utils import (
+                _copy_state_dict,
+                _create_cpu_state_dict,
+            )
+        except ImportError as e:
+            raise ImportError(
+                "Please install the latest PyTorch nightly to use async checkpointing with pinned memory."
+            ) from e
         state_dict = dcp.state_dict_saver._stateful_to_state_dict(self.states)
         if self.cpu_offload_state_dict is None:
             logger.debug(f"Preparing the CPU memory, {time.monotonic()=}.:.2f")
@@ -309,6 +337,7 @@ class CheckpointManager:
         else:
             dcp.save(self.states, checkpoint_id=checkpoint_id)
         self.reset()
+        self._purge_stale_checkpoints()
 
         logger.info(
             "Finished saving the checkpoint (or staging if async is enabled)"
@@ -360,3 +389,18 @@ class CheckpointManager:
             f"Finished loading the checkpoint in {time.monotonic() - begin:.2f} seconds."
         )
         return True
+
+    def _purge_stale_checkpoints(self):
+        if self.keep_latest_k > 0:
+            discovered_checkpoints = []
+            for filename in os.listdir(self.folder):
+                match = re.search(r"step-(\d+)", filename)
+                path = os.path.join(self.folder, filename)
+                discovered_checkpoints.append((int(match.group(1)), path))
+
+            discovered_checkpoints.sort()
+            to_delete = discovered_checkpoints[: -1 * self.keep_latest_k]
+
+            for _, path in to_delete:
+                logger.info(f"Deleting old checkpoint {path}")
+                shutil.rmtree(path, ignore_errors=True)
